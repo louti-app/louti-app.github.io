@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>楼梯 Louti</title>
+<link rel="icon" href="icons/icon.svg?v=78" type="image/svg+xml">
+<link rel="icon" href="icons/icon-192.png?v=78" sizes="192x192">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png?v=78">
+<meta name="theme-color" content="#f6f0e4">
+<script>
+  // Apply the saved theme before anything is drawn (no flash of the wrong one).
+  // "system" leaves it to prefers-color-scheme in style.css.
+  function applyTheme(t) {
+    const root = document.documentElement;
+    if (t === "light" || t === "dark") root.dataset.theme = t; else delete root.dataset.theme;
+    const dark = t === "dark" || (t !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+    document.querySelector('meta[name="theme-color"]').content = dark ? "#15171c" : "#f6f0e4";
+  }
+  try { applyTheme(((JSON.parse(localStorage.getItem("louti-state") || "{}").settings) || {}).theme); } catch (e) { /* storage unavailable */ }
+</script>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Louti">
+<!-- ?v= busts every cache layer at once (browser HTTP cache, old service
+     workers, PWA containers): a changed URL can never be served stale.
+     Bump it alongside sw.js VERSION when shipping. -->
+<link rel="stylesheet" href="style.css?v=78">
+</head>
+<body>
+<div id="app"><p class="loading">Loading…</p></div>
+<!-- Keyboard stand-in: focused during a tap that leads to a typed card, so iOS
+     opens the keyboard inside the gesture; focus then moves to the real answer
+     box, and the keyboard stays up. Fixed and 16px so focusing it can't scroll
+     or zoom the page. -->
+<input id="kbd-proxy" aria-hidden="true" tabindex="-1" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+  style="position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;font-size:16px;border:0;padding:0;pointer-events:none">
+<script src="vendor/hanzi-writer.min.js?v=78"></script>
+<script src="writer-element.js?v=78"></script>
+<script src="main.js?v=78"></script>
+<script>
+(async () => {
+  const KEY = "louti-state";
+  const slot = document.getElementById("app");
+  try {
+    const resp = await fetch("data/corpus.json.gz?v=78");
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const buf = await resp.arrayBuffer();
+    let data;
+    if (new Uint8Array(buf)[0] === 0x1f && new Uint8Array(buf)[1] === 0x8b) {
+      // raw gzip: inflate ourselves (server sent no Content-Encoding)
+      const stream = new Response(
+        new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip")));
+      data = await stream.json();
+    } else {
+      data = JSON.parse(new TextDecoder().decode(buf));
+    }
+    // ask the browser not to evict our storage (Safari ITP deletes
+    // script-writable storage after 7 days without a visit otherwise)
+    if (navigator.storage && navigator.storage.persist) {
+      navigator.storage.persist().catch(() => {});
+    }
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("sw.js").catch(() => {});
+    }
+    const saved = localStorage.getItem(KEY);
+    // one-boot rolling backup: whatever this session writes, the state we
+    // booted from stays recoverable
+    if (saved !== null) {
+      try { localStorage.setItem(KEY + "-backup", saved); } catch (e) { /* ignore */ }
+    }
+    const ios = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const standalone = window.navigator.standalone === true ||
+      window.matchMedia("(display-mode: standalone)").matches;
+    // Fixed bars sit at the bottom of the layout viewport, which iOS Safari can
+    // extend behind its floating toolbar. Lift them by however much of the
+    // layout viewport isn't actually visible (zero on desktop and when installed).
+    const vv = window.visualViewport;
+    const liftBars = () => {
+      const hidden = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+      document.documentElement.style.setProperty("--browser-bar", hidden + "px");
+    };
+    if (vv) { vv.addEventListener("resize", liftBars); vv.addEventListener("scroll", liftBars); }
+    // iOS 26 Safari reports its floating toolbar's area as visible, but draws
+    // over it; in a tab (not installed), keep bottom controls clear of it.
+    const iosTab = /iPad|iPhone|iPod/.test(navigator.userAgent) &&
+      !(window.navigator.standalone === true || window.matchMedia("(display-mode: standalone)").matches);
+    if (iosTab) document.documentElement.classList.add("ios-tab");
+    liftBars();
+    const app = Elm.Main.init({
+      node: slot,
+      flags: {
+        data,
+        saved,
+        backup: localStorage.getItem(KEY + "-backup"),
+        now: Date.now(),
+        tzOffset: new Date().getTimezoneOffset(),
+        iosBrowser: ios && !standalone,
+      },
+    });
+    data = null;
+
+    app.ports.save.subscribe((state) => {
+      try { localStorage.setItem(KEY, state); } catch (e) { /* full/blocked */ }
+    });
+    app.ports.saveBackup.subscribe((state) => {
+      try { localStorage.setItem(KEY + "-backup", state); } catch (e) { /* ignore */ }
+    });
+
+    // Audio: one element, reused. iOS blocks playback until a user gesture,
+    // so the first tap of the session plays a silent clip to unlock it.
+    const audio = new Audio();
+    const silentWav = () => {
+      // 100 samples of 8-bit mono silence: the smallest thing iOS will "play"
+      const n = 100, b = new Uint8Array(44 + n), v = new DataView(b.buffer);
+      const str = (o, s) => [...s].forEach((c, i) => (b[o + i] = c.charCodeAt(0)));
+      str(0, "RIFF"); v.setUint32(4, 36 + n, true); str(8, "WAVEfmt ");
+      v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+      v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true);
+      v.setUint16(34, 8, true); str(36, "data"); v.setUint32(40, n, true); b.fill(128, 44);
+      return "data:audio/wav;base64," + btoa(String.fromCharCode(...b));
+    };
+    audio.preload = "auto";
+    const unlock = () => {
+      audio.src = silentWav();
+      audio.play().catch(() => {});
+      document.removeEventListener("pointerdown", unlock, true);
+    };
+    document.addEventListener("pointerdown", unlock, true);
+    // A failed play is shown for a moment rather than swallowed, so a silent
+    // card can be told apart from a muted phone.
+    const audioFail = (why) => {
+      let el = document.getElementById("audio-fail");
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "audio-fail";
+        el.style.cssText = "position:fixed;left:50%;bottom:calc(1rem + env(safe-area-inset-bottom));transform:translateX(-50%);background:#333;color:#fff;padding:.4rem .8rem;border-radius:6px;font:14px system-ui;z-index:99";
+        document.body.appendChild(el);
+      }
+      el.textContent = "Audio didn't play: " + why;
+      clearTimeout(el._t);
+      el._t = setTimeout(() => el.remove(), 3000);
+    };
+    audio.addEventListener("error", () => {
+      if (!audio.getAttribute("src") || audio.src.startsWith("data:")) return; // stopped, or the unlock clip
+      const code = audio.error ? audio.error.code : 0;
+      audioFail(["", "aborted", "network error", "couldn't decode", "not supported"][code] || "error " + code);
+    });
+    app.ports.setTheme.subscribe(applyTheme);
+    matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+      applyTheme(document.documentElement.dataset.theme || "system");
+    });
+    app.ports.playAudio.subscribe((url) => {
+      if (!url) {
+        // "": stop, including a clip still loading
+        audio.pause();
+        audio.removeAttribute("src");
+        audio.load();
+        return;
+      }
+      audio.src = url;
+      audio.play().catch((e) => { if (e.name !== "AbortError") audioFail(e.name); });
+    });
+
+    // A tap on a control that leads to a typed card (Elm marks it
+    // data-next-typed): focus the stand-in now, inside the gesture, so iOS opens
+    // the keyboard. Capture phase, so this runs before the app handles the tap.
+    const proxy = document.getElementById("kbd-proxy");
+    document.addEventListener("click", (e) => {
+      if (e.target.closest && e.target.closest("[data-next-typed]")) {
+        proxy.focus({ preventScroll: true });
+      }
+    }, true);
+
+    // Copy buttons (data-copy): copy inside the tap. navigator.clipboard needs
+    // HTTPS; over plain HTTP (a LAN test server) fall back to a selected textarea.
+    document.addEventListener("click", (e) => {
+      const el = e.target.closest && e.target.closest("[data-copy]");
+      if (!el) return;
+      const text = el.getAttribute("data-copy");
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).catch(() => {});
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = text; ta.setAttribute("readonly", "");
+        ta.style.cssText = "position:fixed;top:0;left:0;opacity:0;font-size:16px";
+        document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, text.length);
+        try { document.execCommand("copy"); } catch (err) { /* nothing to do */ }
+        ta.remove();
+      }
+    }, true);
+
+    // Back to Browse: restore its scroll once the list is drawn again.
+    app.ports.restoreScroll.subscribe((y) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => window.scrollTo(0, y)));
+    });
+
+    // Move focus to the answer box once it's drawn (from the stand-in, the
+    // keyboard stays up). preventScroll everywhere: the page shouldn't move.
+    app.ports.focusInput.subscribe(() => {
+      requestAnimationFrame(() => {
+        const el = document.getElementById("answer");
+        if (el) el.focus({ preventScroll: true });
+      });
+      const el = document.getElementById("answer");
+      if (el) el.focus({ preventScroll: true });
+    });
+
+    // Export: the share sheet on mobile (iOS: straight to Files/iCloud Drive),
+    // a download elsewhere.
+    app.ports.exportFile.subscribe(async ({ name, text }) => {
+      const file = new File([text], name, { type: "application/json" });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try { await navigator.share({ files: [file], title: name }); return; }
+        catch (e) { if (e && e.name === "AbortError") return; }
+      }
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(file);
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    });
+  } catch (e) {
+    slot.innerHTML = "<p class='loading'>Failed to load: " + e.message + "</p>";
+  }
+})();
+</script>
+</body>
+</html>
